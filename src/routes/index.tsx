@@ -1,379 +1,346 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { useEffect, useState, useRef, useCallback, useMemo } from 'react'
-import { Settings } from 'lucide-react'
-import {
-  SettingsDialog,
-  ChatMessage,
-  LoadingIndicator,
-  ChatInput,
-  Sidebar,
-  WelcomeScreen,
-  TopBanner
-} from '../components'
-import { useConversations, useAppState, store, actions } from '../store'
-import { genAIResponse, type Message } from '../utils'
+import { useState } from 'react'
+
+type FormStatus = 'idle' | 'success' | 'error'
+
+function encodeForm(data: Record<string, string>) {
+  return new URLSearchParams(data).toString()
+}
 
 function Home() {
-  const {
-    conversations,
-    currentConversationId,
-    currentConversation,
-    setCurrentConversationId,
-    createNewConversation,
-    updateConversationTitle,
-    deleteConversation,
-    addMessage,
-  } = useConversations()
-  
-  const { isLoading, setLoading, getActivePrompt } = useAppState()
+  const [submitting, setSubmitting] = useState(false)
+  const [status, setStatus] = useState<FormStatus>('idle')
 
-  // Memoize messages to prevent unnecessary re-renders
-  const messages = useMemo(() => currentConversation?.messages || [], [currentConversation]);
+  const onSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setSubmitting(true)
+    setStatus('idle')
 
-  // Local state
-  const [input, setInput] = useState('')
-  const [editingChatId, setEditingChatId] = useState<string | null>(null)
-  const [editingTitle, setEditingTitle] = useState('')
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false)
-  const messagesContainerRef = useRef<HTMLDivElement>(null)
-  const [pendingMessage, setPendingMessage] = useState<Message | null>(null)
-  const [error, setError] = useState<string | null>(null);
-
-  const scrollToBottom = useCallback((smooth: boolean = false) => {
-    if (messagesContainerRef.current) {
-      messagesContainerRef.current.scrollTo({
-        top: messagesContainerRef.current.scrollHeight,
-        behavior: smooth ? 'smooth' : 'auto'
-      })
-    }
-  }, []);
-
-  // Scroll to bottom when messages change or loading state changes
-  useEffect(() => {
-    scrollToBottom(false)
-  }, [messages, scrollToBottom])
-
-  // Smooth scroll during streaming
-  useEffect(() => {
-    if (pendingMessage && isLoading) {
-      scrollToBottom(true)
-    }
-  }, [pendingMessage, isLoading, scrollToBottom])
-
-  const createTitleFromInput = useCallback((text: string) => {
-    const words = text.trim().split(/\s+/)
-    const firstThreeWords = words.slice(0, 3).join(' ')
-    return firstThreeWords + (words.length > 3 ? '...' : '')
-  }, []);
-
-  // Helper function to process AI response
-  const processAIResponse = useCallback(async (conversationId: string, userMessage: Message) => {
-    try {
-      // Get active prompt
-      const activePrompt = getActivePrompt(store.state)
-      let systemPrompt
-      if (activePrompt) {
-        systemPrompt = {
-          value: activePrompt.content,
-          enabled: true,
-        }
-      }
-
-      // Get AI response
-      const response = await genAIResponse({
-        data: {
-          messages: [...messages, userMessage],
-          systemPrompt,
-        },
-      })
-
-      const reader = response.body?.getReader()
-      if (!reader) {
-        throw new Error('No reader found in response')
-      }
-
-      const decoder = new TextDecoder()
-
-      let done = false
-      let newMessage = {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant' as const,
-        content: '',
-      }
-      let buffer = '' // Buffer to accumulate partial JSON chunks
-      let pendingTextQueue: string[] = [] // Queue of text chunks to render
-      let isRendering = false
-
-      // Smooth character-by-character rendering with adaptive speed
-      const renderTextSmoothly = async () => {
-        if (isRendering) return
-        isRendering = true
-
-        while (pendingTextQueue.length > 0) {
-          const chunk = pendingTextQueue.shift()!
-
-          // Adaptive rendering: faster for code blocks, smoother for regular text
-          const isCodeBlock = newMessage.content.includes('```') &&
-                             newMessage.content.split('```').length % 2 === 0
-
-          // Characters per frame and delay based on content type
-          const charsPerFrame = isCodeBlock ? 5 : 2 // Faster for code
-          const delay = isCodeBlock ? 2 : 5 // Shorter delay for code
-
-          for (let i = 0; i < chunk.length; i += charsPerFrame) {
-            const slice = chunk.slice(i, i + charsPerFrame)
-            newMessage = {
-              ...newMessage,
-              content: newMessage.content + slice,
-            }
-            setPendingMessage({ ...newMessage })
-
-            // Dynamic delay for natural typing rhythm
-            // ~200-400 chars per second for text, ~500 chars per second for code
-            await new Promise(resolve => setTimeout(resolve, delay))
-          }
-        }
-
-        isRendering = false
-      }
-
-      const scheduleUIUpdate = (text: string) => {
-        pendingTextQueue.push(text)
-        renderTextSmoothly()
-      }
-
-      while (!done) {
-        const out = await reader.read()
-        done = out.done
-        if (!done && out.value) {
-          // Decode the chunk and add to buffer
-          buffer += decoder.decode(out.value, { stream: true })
-
-          // Split by newlines to get complete JSON objects
-          const lines = buffer.split('\n')
-
-          // Keep the last incomplete line in the buffer
-          buffer = lines.pop() || ''
-
-          // Process each complete line
-          for (const line of lines) {
-            if (line.trim()) {
-              try {
-                const json = JSON.parse(line)
-                if (json.type === 'content_block_delta' && json.delta?.text) {
-                  scheduleUIUpdate(json.delta.text)
-                }
-              } catch (e) {
-                console.error('Error parsing streaming response:', e, 'Line:', line)
-              }
-            }
-          }
-        }
-      }
-
-      // Wait for any remaining text to finish rendering
-      while (pendingTextQueue.length > 0 || isRendering) {
-        await new Promise(resolve => setTimeout(resolve, 50))
-      }
-
-      setPendingMessage(null)
-      if (newMessage.content.trim()) {
-        // Add AI message to Convex
-        console.log('Adding AI response to conversation:', conversationId)
-        await addMessage(conversationId, newMessage)
-      }
-    } catch (error) {
-      console.error('Error in AI response:', error)
-      // Add an error message to the conversation
-      const errorMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant' as const,
-        content: 'Sorry, I encountered an error generating a response. Please set the required API keys in your environment variables.',
-      }
-      await addMessage(conversationId, errorMessage)
-    }
-  }, [messages, getActivePrompt, addMessage]);
-
-  const handleSubmit = useCallback(async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!input.trim() || isLoading) return
-
-    const currentInput = input
-    setInput('') // Clear input early for better UX
-    setLoading(true)
-    setError(null)
-    
-    const conversationTitle = createTitleFromInput(currentInput)
+    const form = event.currentTarget
+    const formData = new FormData(form)
+    const payload = Object.fromEntries(formData.entries()) as Record<string, string>
 
     try {
-      // Create the user message object
-      const userMessage: Message = {
-        id: Date.now().toString(),
-        role: 'user' as const,
-        content: currentInput.trim(),
-      }
-      
-      let conversationId = currentConversationId
+      const response = await fetch('/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: encodeForm(payload),
+      })
 
-      // If no current conversation, create one in Convex first
-      if (!conversationId) {
-        try {
-          console.log('Creating new Convex conversation with title:', conversationTitle)
-          // Create a new conversation with our title
-          const convexId = await createNewConversation(conversationTitle)
-          
-          if (convexId) {
-            console.log('Successfully created Convex conversation with ID:', convexId)
-            conversationId = convexId
-            
-            // Add user message directly to Convex
-            console.log('Adding user message to Convex conversation:', userMessage.content)
-            await addMessage(conversationId, userMessage)
-          } else {
-            console.warn('Failed to create Convex conversation, falling back to local')
-            // Fallback to local storage if Convex creation failed
-            const tempId = Date.now().toString()
-            const tempConversation = {
-              id: tempId,
-              title: conversationTitle,
-              messages: [],
-            }
-            
-            actions.addConversation(tempConversation)
-            conversationId = tempId
-            
-            // Add user message to local state
-            actions.addMessage(conversationId, userMessage)
-          }
-        } catch (error) {
-          console.error('Error creating conversation:', error)
-          throw new Error('Failed to create conversation')
-        }
-      } else {
-        // We already have a conversation ID, add message directly to Convex
-        console.log('Adding user message to existing conversation:', conversationId)
-        await addMessage(conversationId, userMessage)
+      if (!response.ok) {
+        throw new Error('Submission failed')
       }
-      
-      // Process with AI after message is stored
-      await processAIResponse(conversationId, userMessage)
-      
-    } catch (error) {
-      console.error('Error:', error)
-      const errorMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant' as const,
-        content: 'Sorry, I encountered an error processing your request.',
-      }
-      if (currentConversationId) {
-        await addMessage(currentConversationId, errorMessage)
-      }
-      else {
-        if (error instanceof Error) {
-          setError(error.message)
-        } else {
-          setError('An unknown error occurred.')
-        }
-      }
+
+      form.reset()
+      setStatus('success')
+    } catch {
+      setStatus('error')
     } finally {
-      setLoading(false)
+      setSubmitting(false)
     }
-  }, [input, isLoading, createTitleFromInput, currentConversationId, createNewConversation, addMessage, processAIResponse, setLoading]);
-
-  const handleNewChat = useCallback(() => {
-    createNewConversation()
-  }, [createNewConversation]);
-
-  const handleDeleteChat = useCallback(async (id: string) => {
-    await deleteConversation(id)
-  }, [deleteConversation]);
-
-  const handleUpdateChatTitle = useCallback(async (id: string, title: string) => {
-    await updateConversationTitle(id, title)
-    setEditingChatId(null)
-    setEditingTitle('')
-  }, [updateConversationTitle]);
+  }
 
   return (
-    <div className="relative flex h-screen bg-gray-900">
-      {/* Settings Button */}
-      <div className="absolute z-50 top-5 right-5">
-        <button
-          onClick={() => setIsSettingsOpen(true)}
-          className="flex items-center justify-center w-10 h-10 text-white transition-opacity rounded-full bg-gradient-to-r from-orange-500 to-red-600 hover:opacity-90 focus:outline-none focus:ring-2 focus:ring-orange-500"
-        >
-          <Settings className="w-5 h-5" />
-        </button>
-      </div>
+    <main id="top" className="ac-site">
+      <a href="tel:07982008283" className="sticky-call">Call 07982008283</a>
+      <a href="https://wa.me/917982008283" className="floating-whatsapp" target="_blank" rel="noreferrer">
+        WhatsApp Booking
+      </a>
 
-      {/* Sidebar */}
-      <Sidebar 
-        conversations={conversations}
-        currentConversationId={currentConversationId}
-        handleNewChat={handleNewChat}
-        setCurrentConversationId={setCurrentConversationId}
-        handleDeleteChat={handleDeleteChat}
-        editingChatId={editingChatId}
-        setEditingChatId={setEditingChatId}
-        editingTitle={editingTitle}
-        setEditingTitle={setEditingTitle}
-        handleUpdateChatTitle={handleUpdateChatTitle}
-      />
-
-      {/* Main Content */}
-      <div className="flex flex-col flex-1">
-        <TopBanner />
-        {error && (
-          <p className="w-full max-w-3xl p-4 mx-auto font-bold text-orange-500">{error}</p>
-        )}
-        {currentConversationId ? (
-          <>
-            {/* Messages */}
-            <div
-              ref={messagesContainerRef}
-              className="flex-1 pb-24 overflow-y-auto messages-container"
-            >
-              <div className="w-full max-w-3xl px-4 mx-auto">
-                {[...messages, pendingMessage]
-                  .filter((message): message is Message => message !== null)
-                  .map((message) => (
-                    <ChatMessage
-                      key={message.id}
-                      message={message}
-                      isStreaming={message === pendingMessage && isLoading}
-                    />
-                  ))}
-                {isLoading && <LoadingIndicator />}
-              </div>
+      <section className="hero section">
+        <div className="container hero-grid">
+          <div>
+            <p className="kicker">Chhatarpur and South Delhi</p>
+            <h1>24/7 AC Repair &amp; AC Rental Service in South Delhi</h1>
+            <p className="subheadline">
+              Fast, affordable, and professional air conditioner services at your doorstep with same-day support.
+            </p>
+            <div className="cta-row">
+              <a href="tel:07982008283" className="btn btn-primary">Call Now - 07982008283</a>
+              <a href="https://wa.me/917982008283" className="btn btn-outline" target="_blank" rel="noreferrer">
+                WhatsApp Booking
+              </a>
+              <a href="#book-service" className="btn btn-outline">Request Service</a>
             </div>
-
-            {/* Input */}
-            <ChatInput 
-              input={input}
-              setInput={setInput}
-              handleSubmit={handleSubmit}
-              isLoading={isLoading}
+            <div className="trust-grid">
+              <span>5.0 Google Rating</span>
+              <span>24/7 Emergency Service</span>
+              <span>Local Chhatarpur Experts</span>
+              <span>Same-Day Repair</span>
+            </div>
+          </div>
+          <div className="hero-image-card">
+            <img
+              src="https://images.unsplash.com/photo-1581094288338-2314dddb7ece?auto=format&fit=crop&w=1200&q=80"
+              alt="Technician repairing split AC"
             />
-          </>
-        ) : (
-          <WelcomeScreen 
-            input={input}
-            setInput={setInput}
-            handleSubmit={handleSubmit}
-            isLoading={isLoading}
-          />
-        )}
-      </div>
+          </div>
+        </div>
+      </section>
 
-      {/* Settings Dialog */}
-      <SettingsDialog
-        isOpen={isSettingsOpen}
-        onClose={() => setIsSettingsOpen(false)}
-      />
-    </div>
+      <section id="book-service" className="section">
+        <div className="container">
+          <div className="panel">
+            <h2>Book AC Service</h2>
+            <form
+              name="quick-service-request"
+              method="POST"
+              data-netlify="true"
+              netlify-honeypot="bot-field"
+              onSubmit={onSubmit}
+              className="service-form"
+            >
+              <input type="hidden" name="form-name" value="quick-service-request" />
+              <input type="hidden" name="subject" value="New AC service lead" />
+              <p className="hidden-field">
+                <label>
+                  Leave this field empty:
+                  <input name="bot-field" />
+                </label>
+              </p>
+              <label>
+                Name
+                <input name="name" required />
+              </label>
+              <label>
+                Phone Number
+                <input name="phone" type="tel" required />
+              </label>
+              <label>
+                Service Required
+                <select name="service" required defaultValue="">
+                  <option value="" disabled>Select service</option>
+                  <option>AC Repair</option>
+                  <option>AC Rental</option>
+                  <option>AC Installation</option>
+                  <option>AC Gas Filling</option>
+                  <option>AC Maintenance</option>
+                </select>
+              </label>
+              <label>
+                Location
+                <input name="location" required />
+              </label>
+              <label className="form-wide">
+                Message
+                <textarea name="message" rows={4} />
+              </label>
+              <button className="btn btn-primary form-wide" type="submit" disabled={submitting}>
+                {submitting ? 'Submitting...' : 'Request Service'}
+              </button>
+              {status === 'success' && <p className="form-note success">Request received. A technician will call shortly.</p>}
+              {status === 'error' && <p className="form-note error">Unable to submit now. Please call 07982008283.</p>}
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <section id="services" className="section">
+        <div className="container">
+          <h2>Our Services</h2>
+          <div className="service-grid">
+            <article className="panel">
+              <h3>AC Repair Service</h3>
+              <p>Fast and reliable repair support for all major brands with quick diagnosis and cooling restoration.</p>
+              <ul>
+                <li>Split AC Repair</li>
+                <li>Window AC Repair</li>
+                <li>Cooling Issues</li>
+                <li>Water Leakage Fix</li>
+                <li>Compressor Problems</li>
+              </ul>
+            </article>
+            <article className="panel">
+              <h3>AC Rental Service</h3>
+              <p>Affordable rental solutions for homes, offices, events, and PG accommodations.</p>
+              <ul>
+                <li>Daily, Weekly, and Monthly Rental</li>
+                <li>Weddings and Events</li>
+                <li>Offices and Shops</li>
+                <li>PG and Hostel Cooling</li>
+              </ul>
+            </article>
+            <article className="panel">
+              <h3>AC Installation Service</h3>
+              <p>Professional split and window AC setup with safe electrical integration.</p>
+              <ul>
+                <li>Proper Mounting</li>
+                <li>Safe Wiring</li>
+                <li>Performance Testing</li>
+              </ul>
+            </article>
+            <article className="panel">
+              <h3>AC Gas Filling</h3>
+              <p>Low cooling checks, leak diagnosis, and gas refills with tested process and safety.</p>
+              <ul>
+                <li>R22 Gas Filling</li>
+                <li>R410 Gas Filling</li>
+                <li>Gas Leakage Inspection</li>
+              </ul>
+            </article>
+            <article className="panel">
+              <h3>AC Maintenance &amp; Service</h3>
+              <p>Preventive maintenance to improve efficiency and extend AC lifespan.</p>
+              <ul>
+                <li>Deep AC Cleaning</li>
+                <li>Filter Cleaning</li>
+                <li>Coil Cleaning</li>
+                <li>Performance Check</li>
+              </ul>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section className="section alt">
+        <div className="container split">
+          <div className="panel">
+            <h2>Why Choose Us</h2>
+            <p>Trusted local AC experts in Chhatarpur, committed to fast and professional service delivery.</p>
+            <ul>
+              <li>Experienced Technicians</li>
+              <li>Same-Day Service</li>
+              <li>Affordable Pricing</li>
+              <li>Genuine Spare Parts</li>
+              <li>24/7 Emergency Service</li>
+              <li>Quick Response Time</li>
+            </ul>
+          </div>
+          <div className="panel">
+            <h2>Service Areas</h2>
+            <p>AC services across South Delhi with same-day response for nearby customers.</p>
+            <ul>
+              <li>Chhatarpur</li>
+              <li>Mehrauli</li>
+              <li>Saket</li>
+              <li>Vasant Kunj</li>
+              <li>Malviya Nagar</li>
+              <li>Neb Sarai</li>
+              <li>Aya Nagar</li>
+              <li>Kishangarh</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section className="section">
+        <div className="container">
+          <h2>Customer Reviews</h2>
+          <p className="rating">5.0 Google Rating</p>
+          <div className="review-grid">
+            <article className="panel">
+              <h3>Rohit Sharma</h3>
+              <p>Very quick AC repair service. Technician arrived within 1 hour and fixed my AC cooling issue.</p>
+            </article>
+            <article className="panel">
+              <h3>Amit Verma</h3>
+              <p>Best AC rental service in Chhatarpur. Affordable pricing and quick installation support.</p>
+            </article>
+            <article className="panel">
+              <h3>Neha Gupta</h3>
+              <p>Professional technicians and good behavior. Highly recommended for AC repair.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section className="section offer">
+        <div className="container offer-box">
+          <h2>AC Service Starting at Rs 499</h2>
+          <p>Limited-time offer for customers across South Delhi.</p>
+          <a href="tel:07982008283" className="btn btn-primary">Call Now to Book Service</a>
+        </div>
+      </section>
+
+      <section id="contact" className="section">
+        <div className="container split">
+          <div className="panel">
+            <h2>Contact Palak AC Rental &amp; Repair Service</h2>
+            <p><strong>Address:</strong> Shop No A-28, Near Nanad Hospital, Suman Colony, Block F, Block G, Chhatarpur, New Delhi, Delhi 110074</p>
+            <p><strong>Phone:</strong> <a href="tel:07982008283">07982008283</a></p>
+            <p><strong>Hours:</strong> Open 24 Hours</p>
+            <div className="cta-row">
+              <a href="tel:07982008283" className="btn btn-primary">Call Now</a>
+              <a
+                href="https://maps.google.com/?q=Shop+No+A-28+Near+Nanad+Hospital+Suman+Colony+Chhatarpur+New+Delhi+110074"
+                className="btn btn-outline"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Get Directions
+              </a>
+              <a href="https://wa.me/917982008283" className="btn btn-outline" target="_blank" rel="noreferrer">
+                WhatsApp Chat
+              </a>
+            </div>
+          </div>
+          <div className="panel map-card">
+            <iframe
+              title="Palak AC Rental and Repair Service map"
+              loading="lazy"
+              referrerPolicy="no-referrer-when-downgrade"
+              src="https://maps.google.com/maps?q=Shop%20No%20A-28%20Near%20Nanad%20Hospital%20Suman%20Colony%20Chhatarpur%20New%20Delhi%20110074&t=&z=14&ie=UTF8&iwloc=&output=embed"
+            />
+          </div>
+        </div>
+      </section>
+
+      <footer className="section footer">
+        <div className="container footer-grid">
+          <div>
+            <h3>Palak AC Rental &amp; Repair Service</h3>
+            <p>Your trusted local experts for AC repair, AC rental, installation, and maintenance in South Delhi.</p>
+          </div>
+          <div>
+            <h4>Quick Links</h4>
+            <ul>
+              <li><a href="#top">Home</a></li>
+              <li><a href="#services">Services</a></li>
+              <li><a href="#contact">Contact</a></li>
+            </ul>
+          </div>
+          <div>
+            <h4>Services</h4>
+            <ul>
+              <li>AC Repair</li>
+              <li>AC Rental</li>
+              <li>AC Installation</li>
+              <li>AC Gas Filling</li>
+              <li>AC Maintenance</li>
+            </ul>
+          </div>
+          <div>
+            <h4>Contact</h4>
+            <p>Phone: 07982008283</p>
+            <p>Address: Chhatarpur, New Delhi</p>
+            <p className="copyright">© 2026 Palak AC Rental &amp; Repair Service</p>
+          </div>
+        </div>
+        <div className="container seo-line">
+          AC Repair in Chhatarpur | AC Service in South Delhi | AC Rental in Chhatarpur | Split AC Repair Delhi | 24 Hour AC Repair Delhi
+        </div>
+      </footer>
+    </main>
   )
 }
 
 export const Route = createFileRoute('/')({
+  head: () => ({
+    meta: [
+      {
+        title: 'Palak AC Rental & Repair Service | 24/7 AC Repair in South Delhi',
+      },
+      {
+        name: 'description',
+        content:
+          'Book same-day AC repair, rental, gas filling, installation, and maintenance in Chhatarpur and South Delhi. Call 07982008283.',
+      },
+      {
+        name: 'keywords',
+        content:
+          'AC Repair in Chhatarpur, AC Service in South Delhi, AC Rental in Chhatarpur, Split AC Repair Delhi, 24 Hour AC Repair Delhi',
+      },
+    ],
+  }),
   component: Home,
 })
